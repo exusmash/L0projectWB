@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	_ "github.com/lib/pq"
 	"github.com/nats-io/stan.go"
 	"log"
@@ -119,26 +120,18 @@ func getOrderHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-
+	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(jsonData)
 }
 
 func readOrderById(id string) (Order, error) {
-	var orderData Order
-	err := db.QueryRow("SELECT * FROM orders WHERE order_uid = $1", id).Scan(
-		&orderData.OrderUid,
-		&orderData.TrackNumber,
-		&orderData.Entry,
-		&orderData.Locale,
-		&orderData.InternalSignature,
-		&orderData.CustomerId,
-		&orderData.DeliveryService,
-		&orderData.Shardkey,
-		&orderData.SmId,
-		&orderData.DateCreated,
-		&orderData.OofShard)
-	return orderData, err
+	// Проверяем, есть ли заказ в кэше
+	if order, ok := cache[id]; ok {
+		return order, nil
+	}
+	// Если заказа нет в кэше, возвращаем ошибку
+	return Order{}, errors.New("order not found in cache")
 }
 
 func initDB() {
@@ -174,7 +167,24 @@ func readDB() []Order {
 		log.Println(err)
 		return nil
 	}
-	defer tx.Rollback() // Откат транзакции в случае ошибки
+
+	// Отложенный вызов функции commit в случае успешного выполнения
+	defer func() {
+		if err != nil {
+			// В случае ошибки вызываем откат транзакции
+			err := tx.Rollback()
+			if err != nil {
+				log.Println("Transaction rolled back due to error:", err)
+				return
+			}
+		} else {
+			// В случае успешного выполнения транзакции вызываем commit
+			err = tx.Commit()
+			if err != nil {
+				log.Println("Error committing transaction:", err)
+			}
+		}
+	}()
 
 	// Чтение данных из таблицы orders
 	rows, err := tx.Query(`
@@ -187,7 +197,7 @@ func readDB() []Order {
 	defer func(rows *sql.Rows) {
 		err := rows.Close()
 		if err != nil {
-
+			log.Println("Error closing rows:", err)
 		}
 	}(rows)
 
@@ -356,5 +366,23 @@ func writeCache(order Order) {
 
 // Функция обработки сообщений из NATS
 func handleMessage(data []byte) {
+	// Распаковка данных из NATS-сообщения
+	var orderData Order
+	err := json.Unmarshal(data, &orderData)
+	if err != nil {
+		log.Println("Error unmarshalling NATS message:", err)
+		return
+	}
 
+	// Сохранение данных в базе данных
+	err = writeToDB(orderData)
+	if err != nil {
+		log.Println("Error writing to database:", err)
+		return
+	}
+
+	// Сохранение данных в кэше
+	writeCache(orderData)
+
+	log.Println("Order processed successfully:", orderData.OrderUid)
 }
