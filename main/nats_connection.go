@@ -1,18 +1,15 @@
 package main
 
 import (
-	_ "fmt"
 	"github.com/nats-io/stan.go"
 	"log"
-	_ "time"
+	"time"
 )
 
 const (
 	natsURL   = "nats://localhost:4222"
 	clusterID = "test-cluster"
 	clientID  = "service-client"
-	channel   = "orders"
-	durableID = "service-durable"
 	subject   = "new-orders"
 )
 
@@ -20,10 +17,14 @@ var sc stan.Conn
 
 func initNATS() {
 	var err error
-	//Подключение к NATS-streaming
-	sc, err = stan.Connect(clusterID, clientID, stan.NatsURL(natsURL))
-	if err != nil {
-		log.Fatal(err)
+	for {
+		// Попытка подключения к NATS-streaming с ретраями в случае неудачи
+		sc, err = stan.Connect(clusterID, clientID, stan.NatsURL(natsURL))
+		if err == nil {
+			break
+		}
+		log.Printf("Не удалось подключиться к NATS: %v, повторная попытка через 5 секунд", err)
+		time.Sleep(5 * time.Second)
 	}
 }
 
@@ -41,7 +42,7 @@ func closeNATS() {
 	if sc != nil {
 		err := sc.Close()
 		if err != nil {
-			return
+			log.Println(err)
 		}
 	}
 }

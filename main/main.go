@@ -3,12 +3,13 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
-	"errors"
+	"fmt"
+	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
 	"github.com/nats-io/stan.go"
+	"html/template"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -67,13 +68,14 @@ type Order struct {
 }
 
 var (
-	databaseURL = "postgres://postgres:12345@localhost:5432/mypostgres?sslmode=disable"
 	cache       = make(map[string]Order)
-	db          *sql.DB
+	databaseURL = "postgres://postgres:12345@localhost:5432/local_db?sslmode=disable"
+	db          *sqlx.DB
 )
 
 func main() {
 	initDB()
+
 	for _, order := range readDB() {
 		cache[order.OrderUid] = order
 	}
@@ -89,56 +91,66 @@ func main() {
 	}(subscription)
 
 	// Инициализация HTTP-сервера
-	http.HandleFunc("/order/", getOrderHandler)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", HomePage)
+	mux.HandleFunc("/record", IdPage)
+	mux.HandleFunc("/list/", DataListPage)
+
+	log.Println("server started on port :8080")
 
 	// Запуск HTTP-сервера
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":8080", mux))
 }
 
-func getOrderHandler(w http.ResponseWriter, r *http.Request) {
-	// Извлекаем id из URL
-	id := strings.TrimPrefix(r.URL.Path, "/order/")
-
-	// Проверяем, есть ли заказ в кэше
-	order, ok := cache[id]
-	if !ok {
-		// Если заказа нет в кэше, пытаемся прочитать его из базы данных
-		order, err := readOrderById(id)
-		if err != nil {
-			// Если не удалось прочитать из БД, возвращаем ошибку
-			http.Error(w, "Order not found", http.StatusNotFound)
-			return
-		}
-
-		// Сохраняем заказ в кэше
-		cache[id] = order
-	}
-
-	// Преобразуем заказ в JSON и отправляем клиенту
-	jsonData, err := json.Marshal(order)
+func HomePage(w http.ResponseWriter, r *http.Request) {
+	tmpl, err := template.ParseFiles("static/home-page.html")
 	if err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		log.Println(err.Error())
+		http.Error(w, "Internal server error", 500)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(jsonData)
+	err = tmpl.Execute(w, nil)
+	if err != nil {
+		log.Println(err.Error())
+		http.Error(w, "Internal server error", 500)
+		return
+	}
 }
 
-func readOrderById(id string) (Order, error) {
-	// Проверяем, есть ли заказ в кэше
-	if order, ok := cache[id]; ok {
-		return order, nil
+func IdPage(w http.ResponseWriter, r *http.Request) { // страница с записью с заданным id
+	needId := r.URL.Query().Get("id")
+	if _, ok := cache[needId]; ok {
+		b, _ := json.Marshal(cache[needId])
+		_, err := w.Write(b)
+		if err != nil {
+			log.Println(err.Error())
+		}
+	} else {
+		_, err := w.Write([]byte("Запись не найдена"))
+		if err != nil {
+			log.Println(err.Error())
+		}
 	}
-	// Если заказа нет в кэше, возвращаем ошибку
-	return Order{}, errors.New("order not found in cache")
+}
+
+func DataListPage(w http.ResponseWriter, r *http.Request) { // страница вывода списка всех записей
+	outputArray := make([]Order, 0)
+	for _, elem := range cache {
+		outputArray = append(outputArray, elem)
+	}
+
+	b, _ := json.Marshal(outputArray)
+	_, err := w.Write(b)
+	if err != nil {
+		log.Println(err.Error())
+	}
 }
 
 func initDB() {
 	var err error
 
 	// Открываем соединение с базой данных
-	db, err = sql.Open("postgres", databaseURL)
+	db, err = sqlx.Open("postgres", databaseURL)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -148,6 +160,8 @@ func initDB() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	fmt.Println("Connected to the database")
 }
 
 func closeDB() {
@@ -161,37 +175,12 @@ func closeDB() {
 func readDB() []Order {
 	var orders []Order
 
-	// Начало транзакции чтения
-	tx, err := db.Begin()
-	if err != nil {
-		log.Println(err)
-		return nil
-	}
-
-	// Отложенный вызов функции commit в случае успешного выполнения
-	defer func() {
-		if err != nil {
-			// В случае ошибки вызываем откат транзакции
-			err := tx.Rollback()
-			if err != nil {
-				log.Println("Transaction rolled back due to error:", err)
-				return
-			}
-		} else {
-			// В случае успешного выполнения транзакции вызываем commit
-			err = tx.Commit()
-			if err != nil {
-				log.Println("Error committing transaction:", err)
-			}
-		}
-	}()
-
 	// Чтение данных из таблицы orders
-	rows, err := tx.Query(`
-		SELECT * FROM orders
-	`)
+	rows, err := db.Query(`
+        SELECT * FROM orders
+    `)
 	if err != nil {
-		log.Println(err)
+		log.Printf("Error executing SQL query: %v\n", err)
 		return nil
 	}
 	defer func(rows *sql.Rows) {
@@ -200,7 +189,6 @@ func readDB() []Order {
 			log.Println("Error closing rows:", err)
 		}
 	}(rows)
-
 	// Цикл по результатам запроса
 	for rows.Next() {
 		var orderData Order
@@ -218,26 +206,26 @@ func readDB() []Order {
 			&orderData.OofShard,
 		)
 		if err != nil {
-			log.Println(err)
+			log.Printf("Error executing SQL query: %v\n", err)
 			continue
 		}
 
 		// Чтение данных из связанных таблиц
-		err = readDelivery(tx, &orderData.Delivery, orderData.OrderUid)
+		err = readDelivery(&orderData.Delivery, orderData.CustomerId)
 		if err != nil {
-			log.Println(err)
+			log.Printf("Error executing SQL query: %v\n", err)
 			continue
 		}
 
-		err = readPayment(tx, &orderData.Payment, orderData.OrderUid)
+		err = readPayment(&orderData.Payment, orderData.OrderUid)
 		if err != nil {
-			log.Println(err)
+			log.Printf("Error executing SQL query: %v\n", err)
 			continue
 		}
 
-		err = readItems(tx, &orderData.Items, orderData.OrderUid)
+		err = readItems(&orderData.Items, orderData.OrderUid)
 		if err != nil {
-			log.Println(err)
+			log.Printf("Error executing SQL query: %v\n", err)
 			continue
 		}
 
@@ -249,10 +237,10 @@ func readDB() []Order {
 }
 
 // Функция для чтения данных из таблицы deliveries
-func readDelivery(tx *sql.Tx, delivery *Delivery, orderUID string) error {
-	row := tx.QueryRow(`
-		SELECT * FROM deliveries WHERE customer_id = $1
-	`, orderUID)
+func readDelivery(delivery *Delivery, customerId string) error {
+	row := db.QueryRow(`
+        SELECT name, phone, zip, city, address, region, email FROM deliveries WHERE customer_id = $1
+    `, customerId)
 
 	return row.Scan(
 		&delivery.Name,
@@ -266,10 +254,10 @@ func readDelivery(tx *sql.Tx, delivery *Delivery, orderUID string) error {
 }
 
 // Функция для чтения данных из таблицы payments
-func readPayment(tx *sql.Tx, payment *Payment, orderUID string) error {
-	row := tx.QueryRow(`
-		SELECT * FROM payments WHERE order_uid = $1
-	`, orderUID)
+func readPayment(payment *Payment, orderUID string) error {
+	row := db.QueryRow(`
+        SELECT transaction, request_id, currency, provider, amount, payment_dt, bank, delivery_cost, goods_total, custom_fee FROM payments WHERE order_uid = $1
+    `, orderUID)
 
 	return row.Scan(
 		&payment.Transaction,
@@ -286,10 +274,10 @@ func readPayment(tx *sql.Tx, payment *Payment, orderUID string) error {
 }
 
 // Функция для чтения данных из таблицы items
-func readItems(tx *sql.Tx, items *[]Item, orderUID string) error {
-	rows, err := tx.Query(`
-		SELECT * FROM items WHERE order_uid = $1
-	`, orderUID)
+func readItems(items *[]Item, orderUID string) error {
+	rows, err := db.Query(`
+        SELECT chrt_id, track_number, price, rid, name, sale, size, total_price, nm_id, brand,status FROM items WHERE order_uid = $1
+    `, orderUID)
 	if err != nil {
 		return err
 	}
@@ -311,7 +299,7 @@ func readItems(tx *sql.Tx, items *[]Item, orderUID string) error {
 			&item.Status,
 		)
 		if err != nil {
-			log.Println(err)
+			log.Printf("Error executing SQL query: %v\n", err)
 			continue
 		}
 		*items = append(*items, item)
@@ -320,37 +308,59 @@ func readItems(tx *sql.Tx, items *[]Item, orderUID string) error {
 	return nil
 }
 
-// Функция для записи данных заказа в базу данных
 func writeToDB(order Order) error {
-	// Выполнение SQL-запроса для вставки или обновления данных в БД
-	_, err := db.Exec(`INSERT INTO orders (order_uid, track_number, entry, locale, internal_signature, customer_id, delivery_service, shardkey, sm_id, date_created, oof_shard)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (order_uid) DO NOTHING`, order.OrderUid, order.TrackNumber, order.Entry, order.Locale, order.InternalSignature, order.CustomerId, order.DeliveryService, order.Shardkey, order.SmId, order.DateCreated, order.OofShard)
+	// Начало транзакции
+	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 
-	_, err = db.Exec(`INSERT INTO deliveries (customer_id, name, phone, zip, city, address, region, email)
+	// Отложенный вызов функции для commit или rollback в зависимости от результата
+	defer func() {
+		if err != nil {
+			// В случае ошибки вызываем откат транзакции
+			err := tx.Rollback()
+			if err != nil {
+				log.Println("Transaction rolled back due to error:", err)
+			}
+		} else {
+			// В случае успешного выполнения транзакции вызываем commit
+			err = tx.Commit()
+			if err != nil {
+				log.Println("Error committing transaction:", err)
+			}
+		}
+	}()
+
+	// Выполнение SQL-запросов в рамках транзакции
+	_, err = tx.Exec(`
+		INSERT INTO orders (order_uid, track_number, entry, locale, internal_signature, customer_id, delivery_service, shardkey, sm_id, date_created, oof_shard)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		order.OrderUid, order.TrackNumber, order.Entry, order.Locale, order.InternalSignature, order.CustomerId, order.DeliveryService, order.Shardkey, order.SmId, order.DateCreated, order.OofShard)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(`
+		INSERT INTO deliveries (customer_id, name, phone, zip, city, address, region, email)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (customer_id) DO NOTHING
-	`, order.OrderUid, order.Delivery.Name, order.Delivery.Phone, order.Delivery.Zip, order.Delivery.City, order.Delivery.Address, order.Delivery.Region, order.Delivery.Email)
+	`, order.CustomerId, order.Delivery.Name, order.Delivery.Phone, order.Delivery.Zip, order.Delivery.City, order.Delivery.Address, order.Delivery.Region, order.Delivery.Email)
 	if err != nil {
 		return err
 	}
 
-	_, err = db.Exec(`
+	_, err = tx.Exec(`
 		INSERT INTO payments (order_uid, transaction, request_id, currency, provider, amount, payment_dt, bank, delivery_cost, goods_total, custom_fee)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-		ON CONFLICT (order_uid) DO NOTHING
 	`, order.OrderUid, order.Payment.Transaction, order.Payment.RequestId, order.Payment.Currency, order.Payment.Provider, order.Payment.Amount, order.Payment.PaymentDt, order.Payment.Bank, order.Payment.DeliveryCost, order.Payment.GoodsTotal, order.Payment.CustomFee)
 	if err != nil {
 		return err
 	}
 
 	for _, item := range order.Items {
-		_, err = db.Exec(`
+		_, err = tx.Exec(`
 		INSERT INTO items (order_uid, chrt_id, track_number, price, rid, name, sale, size, total_price, nm_id, brand, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-		ON CONFLICT (order_uid, track_number) DO NOTHING
 	`, order.OrderUid, item.ChrtId, item.TrackNumber, item.Price, item.Rid, item.Name, item.Sale, item.Size, item.TotalPrice, item.NmId, item.Brand, item.Status)
 		if err != nil {
 			return err
